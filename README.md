@@ -19,7 +19,5 @@ Install release 12.1 on a mirrored ada0 and ada1 disks:
 ./FreeBSD-install -d /dev/ada0,/dev/ada1 -h myhost.my.domain.com -s 512M -r 12.1
 ```
 
-Do any tweaks of your fresh installation under /mnt directory.
-After reboot host should be ready and ssh accessible.
-Always run system update and boot it once more!
-Congratulations!
+Do any tweaks of your fresh installation under /mnt directory. Probably you want to adjust your time zone. After reboot host should be ready and ssh accessible.
+Always run system update and boot it once more. Congratulations!
