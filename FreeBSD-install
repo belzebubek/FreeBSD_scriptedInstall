@@ -201,7 +201,7 @@ tcp_svcs = "{ 2222 }"
 udp_svcs = "{ 123 }"
 icmp_types = "{ echoreq, unreach }"     # icmp types
 
-scrub in on $public_int all fragment reassemble
+scrub in on \$public_int all fragment reassemble
 
 ## ignore loopback interface
 set skip on lo
