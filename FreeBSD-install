@@ -1,0 +1,223 @@
+#!/bin/sh
+# simple script deploying basic FreeBSD system on a remote server
+
+##############################################################################
+# Functions
+##############################################################################
+err_msg(){ >&2 echo $@; }          # drop error message to stderr
+die_err(){ >&2 echo $@; exit 1; }  # drop error message and die
+show_help(){                       # display how to use the script
+cat << EOT
+Usage: ${0} -d DISK[,DISK] -h HOSTNAME
+    -d DISK[,DISK] - provide disk device[s] to use (full paths)
+    -h NAME - FQDN host name to be used for installed host
+    -s SWAPSIZE - specify swap size like 256M or 8G
+    -r RELEASE - pick OS release to install, for example: 12.1
+EOT
+}
+
+##############################################################################
+# initial checks
+##############################################################################
+# wee want to be executed on a FreeBSD rescue system
+SYS=`uname -o`;
+if [ "${SYS}x" != "FreeBSDx" ]; then
+   echo "OS does not match FreeBSD system, aborting";
+   exit 1;
+fi
+
+# check arguments passed to the script
+while getopts ":h:d:s:r:" opt; do
+  case $opt in
+   h)
+     HNAME=${OPTARG}
+     ;;
+   d)
+     DISK=${OPTARG}
+     for X in `echo ${DISK}|sed 's/,/ /g'`;
+       do
+          if [ ! -c ${X} ]; then
+            die_err "\"${X}\": is not a character device. Aborting.";
+          fi
+       done
+     let VDEVNUM=`echo ${DISK}| tr -d -C ,|wc -c`+1 > /dev/null
+     ;;
+   s)
+     SWSIZE=${OPTARG}
+     ;;
+   r)
+     REL=${OPTARG}
+     ;;
+   \?)
+     echo "Invalid option: -$OPTARG" >&2
+     show_help
+     exit 1
+     ;;
+  esac
+done
+
+# check required arguments
+if [ -z ${DISK+x} ]; then
+  die_err "Aborting - no disk drive was provided";
+fi
+if [ -z ${HNAME+x} ]; then
+  die_err "Aborting - no host name given";
+fi
+if [ -z ${SWSIZE+x} ]; then
+  die_err "Aborting - no swap size given";
+fi
+if [ -z ${REL+x} ]; then
+  die_err "Aborting - you need specify which FreeBSD release to install";
+fi
+
+# START here - ask for confirmation
+unset LANG;
+export LC_ALL=C
+
+echo "!!! this script will WIPE ALL YOUR DATA on ${DISK} !!!"
+read -p "Do you really want to continue? [YES] " confirm
+
+if [ "x$confirm" != "xYES" ]; then
+  echo "aborting";
+  exit 1;
+fi
+
+# WIPING PART
+if [ ${VDEVNUM} -eq 1 ]; then
+  dd if=/dev/zero of=${DISK} bs=1M count=1 > /dev/null || exit 1
+  gpart destroy -F ${DISK} # intentionally do not check exit status
+  gpart create -s gpt ${DISK} || exit 1
+  gpart add -t freebsd-boot -s 512k -l boot ${DISK} || exit 1
+  gpart add -t freebsd-swap -s ${SWSIZE} -l swap ${DISK} || exit 1
+  gpart add -t freebsd-ufs -s 11g -l system ${DISK} || exit 1
+else
+  let NUM=0
+  for X in `echo ${DISK}|sed 's/,/ /g'`;
+    do
+      gpart destroy -F ${X} || exit 1
+      gpart create -s gpt ${X} || exit 1
+      gpart add -t freebsd-boot -s 512k -l boot${NUM} ${X} || exit 1
+      gpart add -t freebsd-swap -s ${SWSIZE} -l swap${NUM} ${X} || exit 1
+      gpart add -t freebsd-ufs -s 11g -l system${NUM} ${X} || exit 1
+      let NUM=$NUM+1
+    done
+fi
+
+if [ ${VDEVNUM} -eq 1 ]; then
+  SYSTEMDEV="/dev/gpt/system";
+  SWAPDEV="/dev/gpt/swap";
+else
+  let NUM=0
+  SWAPM=""
+  SYSTEMM=""
+  while [ $NUM -lt $VDEVNUM ]; do
+      SWAPM="$SWAPM /dev/gpt/swap$NUM";
+      SYSTEMM="$SYSTEMM /dev/gpt/system$NUM";
+      let NUM=$NUM+1;
+    done
+  kldload -n geom_mirror
+  gmirror label -h swap ${SWAPM} || exit 1
+  gmirror label -h system ${SYSTEMM} || exit 1
+  SYSTEMDEV="/dev/mirror/system";
+  SWAPDEV="/dev/mirror/swap";
+fi
+
+newfs ${SYSTEMDEV} || exit 1
+mount ${SYSTEMDEV} /mnt || exit 1
+
+cd /mnt/ || exit 1
+fetch http://ftp.freebsd.org/pub/FreeBSD/releases/amd64/${REL}-RELEASE/base.txz || exit 1
+fetch http://ftp.freebsd.org/pub/FreeBSD/releases/amd64/${REL}-RELEASE/kernel.txz || exit 1
+echo "extracting base ..."
+tar xJf base.txz || exit 1
+echo "extracting kernel ..."
+tar xJf kernel.txz || exit 1
+rm -f base.txz kernel.txz
+
+if [ ${VDEVNUM} -eq 1 ]; then
+    gpart bootcode -b /mnt/boot/pmbr -p /mnt/boot/gptboot -i 1 ${DISK} || exit 1
+else
+    for X in `echo ${DISK}|sed 's/,/ /g'`;
+      do
+        gpart bootcode -b /mnt/boot/pmbr -p /mnt/boot/gptboot -i 1 ${X} || exit 1
+      done
+fi
+
+cp -p /mnt/usr/share/zoneinfo/Europe/Warsaw /mnt/etc/localtime
+
+cp /etc/resolv.conf /mnt/etc/resolv.conf || exit 1
+
+cat > /mnt/etc/fstab << EOT
+${SYSTEMDEV} / ufs rw,noatime 1 1
+${SWAPDEV}.eli  none swap sw 0 0
+fdescfs /dev/fd  fdescfs  rw  0  0
+EOT
+
+ROUTER=`netstat -rn4|grep ^default|awk '{print $2}'`;
+IFACE=`netstat -rn4|grep ^default|awk '{print $4}'`;
+IPADDR=`ifconfig ${IFACE} | grep "inet "| awk '{print $2}'`;
+IPMASK=`ifconfig ${IFACE} | grep "inet "| awk '{print $4}'`;
+IPBCAST=`ifconfig ${IFACE} | grep "inet "| awk '{print $6}'`;
+cat > /mnt/etc/rc.conf << EOT
+hostname="${HNAME}"
+sshd_enable="YES"
+ifconfig_${IFACE}="inet ${IPADDR} netmask ${IPMASK} broadcast ${IPBCAST}"
+defaultrouter="${ROUTER}"
+ntpdate_enable="YES"
+ntpd_enable="YES"
+dumpdev="NO"
+local_unbound_enable="YES"
+pf_enable="YES"
+sendmail_enable="NO"
+sendmail_submit_enable="NO"
+sendmail_outbound_enable="NO"
+sendmail_msp_queue_enable="NO"
+EOT
+
+cat >> /mnt/etc/ssh/sshd_config << EOT
+# local config, auto-generated
+Port 2222
+PermitRootLogin without-password
+AddressFamily inet
+ListenAddress ${IPADDR}
+ClientAliveInterval 5
+ClientAliveCountMax 3
+EOT
+
+cat > /mnt/boot/loader.conf << EOT
+geom_mirror_load="YES"
+pf_load="YES"
+aesni_load="YES"
+EOT
+
+mkdir -p /mnt/root/.ssh || exit 1
+cat > /mnt/root/.ssh/authorized_keys <<EOT
+# paste your public SSH keys here to access the machine as root
+EOT
+
+cat > /mnt/etc/pf.conf <<EOT
+public_int = "${IFACE}"
+tcp_svcs = "{ 2222 }"
+udp_svcs = "{ 123 }"
+icmp_types = "{ echoreq, unreach }"     # icmp types
+
+scrub in on $public_int all fragment reassemble
+
+## ignore loopback interface
+set skip on lo
+
+## restrict incoming traffic / unrestrict outgoing traffic
+block in all
+block in quick inet6 all
+pass out all keep state
+
+## allow tcp ports specified by \$tcp_svcs
+pass in quick on \$public_int proto tcp from any to any port \$tcp_svcs keep state
+pass in quick on \$public_int proto udp from any to any port \$udp_svcs keep state
+
+## allow icmp request types specified by \$icmp_types
+pass in inet proto icmp all icmp-type \$icmp_types
+EOT
+cat > /mnt/etc/sysctl.conf <<EOT
+net.inet.ip.random_id=1
+EOT
